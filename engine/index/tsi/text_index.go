@@ -18,29 +18,83 @@ package tsi
 
 import (
 	"fmt"
+	"os"
+	"path"
+	"sync"
 
+	"github.com/openGemini/openGemini/engine/index/clv"
+	"github.com/openGemini/openGemini/lib/fileops"
 	"github.com/openGemini/openGemini/lib/tracing"
 	"github.com/openGemini/openGemini/open_src/influx/influxql"
 	"github.com/openGemini/openGemini/open_src/influx/query"
 	"github.com/openGemini/openGemini/open_src/vm/protoparser/influx"
 )
 
+const (
+	TextDirectory = "text"
+)
+
 type TextIndex struct {
+	fieldTable     map[string]map[string]*clv.TokenIndex // (measurementName, fieldName) -> *TokenIndex table
+	fieldTableLock sync.RWMutex
+	path           string
 }
 
 func NewTextIndex(opts *Options) (*TextIndex, error) {
-	textIndex := &TextIndex{}
-
-	if err := textIndex.Open(); err != nil {
-		return nil, err
+	textIndex := &TextIndex{
+		fieldTable: make(map[string]map[string]*clv.TokenIndex),
+		path:       opts.path, // = data/db/pt/rp/index/indexid..
 	}
-
 	return textIndex, nil
 }
 
+func (idx *TextIndex) NewTokenIndex(path, measurement, field string) error {
+	opts := clv.Options{
+		Path:        path,
+		Measurement: measurement,
+		Field:       field,
+	}
+	tokenIndex, err := clv.NewTokenIndex(&opts)
+	if err != nil {
+		return err
+	}
+	if _, ok := idx.fieldTable[measurement]; !ok {
+		idx.fieldTable[measurement] = make(map[string]*clv.TokenIndex)
+	}
+
+	idx.fieldTable[measurement][field] = tokenIndex
+	return nil
+}
+
 func (idx *TextIndex) Open() error {
-	fmt.Println("TextIndex Open")
-	// TODO
+	path := path.Join(idx.path, TextDirectory)
+	mstDirs, err := fileops.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fileops.MkdirAll(path, 0750)
+		}
+		return err
+	}
+
+	for mstIdx := range mstDirs {
+		if !mstDirs[mstIdx].IsDir() {
+			continue
+		}
+		measurement := mstDirs[mstIdx].Name()
+		tmpMstDir := path + "/" + measurement
+		fieldDirs, err := fileops.ReadDir(tmpMstDir)
+		if err != nil {
+			continue
+		}
+		// fulltext/measuremnt/field
+		for fieldIdx := range fieldDirs {
+			if !fieldDirs[fieldIdx].IsDir() {
+				continue
+			}
+			field := fieldDirs[fieldIdx].Name()
+			idx.NewTokenIndex(idx.path, measurement, field)
+		}
+	}
 	return nil
 }
 
@@ -51,8 +105,38 @@ func (idx *TextIndex) Close() error {
 }
 
 func (idx *TextIndex) CreateIndexIfNotExists(primaryIndex PrimaryIndex, row *influx.Row) (uint64, error) {
-	//fmt.Println("TextIndex CreateIndexIfNotExists")
-	// TODO
+	var field influx.Field
+	tsid := row.SeriesId
+	timestamp := row.Timestamp
+	// Find the field need to be created index.
+	for _, opt := range row.IndexOptions {
+		if opt.Oid == uint32(Text) {
+			if int(opt.IndexList[0]) < len(row.Tags) {
+				return 0, fmt.Errorf("cannot create text index for tag: %s", row.Tags[opt.IndexList[0]].Key)
+			}
+
+			field = row.Fields[int(opt.IndexList[0])-len(row.Tags)]
+			if field.Type != influx.Field_Type_String {
+				return 0, fmt.Errorf("field type must be string for TextIndex")
+			}
+
+			tokenIndex, ok := idx.fieldTable[row.Name][field.Key]
+			if !ok {
+				idx.fieldTableLock.Lock()
+				if idx.fieldTable[row.Name][field.Key] == nil {
+					idx.NewTokenIndex(idx.path, row.Name, field.Key)
+				}
+				idx.fieldTableLock.Unlock()
+				tokenIndex = idx.fieldTable[row.Name][field.Key]
+			}
+			err := tokenIndex.AddDocument(field.StrValue, tsid, timestamp)
+			if err != nil {
+				return 0, err
+			}
+
+		}
+	}
+
 	return 0, nil
 }
 
