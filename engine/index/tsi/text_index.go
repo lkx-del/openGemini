@@ -48,9 +48,10 @@ func NewTextIndex(opts *Options) (*TextIndex, error) {
 	return textIndex, nil
 }
 
-func (idx *TextIndex) NewTokenIndex(path, measurement, field string) error {
+func (idx *TextIndex) NewTokenIndex(idxPath, measurement, field string) error {
+	txtIdxPath := path.Join(idxPath, TextDirectory)
 	opts := clv.Options{
-		Path:        path,
+		Path:        txtIdxPath,
 		Measurement: measurement,
 		Field:       field,
 	}

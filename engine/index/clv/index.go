@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/mergeset"
@@ -30,18 +31,20 @@ import (
 
 const (
 	txPrefixPos = iota
-	txPrefixSid
-	txPrefixId
 	txPrefixTerm
 	txPrefixDic
 	txPrefixDicVersion
+	txPrefixSid
+	txPrefixId
+	txSuffix = 9
 )
 
 const (
-	qmin     = 1
-	posFlag  = 1
-	idFlag   = 2
-	txSuffix = 9
+	qmin        = 1
+	posFlag     = 1
+	idFlag      = 2
+	maxBuf      = 50000
+	maxItemSize = 64 * 1024
 )
 
 type InvertState struct {
@@ -83,16 +86,20 @@ type TokenIndex struct {
 	tb          *mergeset.Table
 	root        *TrieNode
 	analyzer    *Analyzer
-	analyzerVer int
 	trieLock    sync.RWMutex
+	closing     chan struct{}
+	signal      chan struct{}
 	path        string
 	measurement string
 	field       string
+	docNum      uint32
 }
 
 func NewTokenIndex(opts *Options) (*TokenIndex, error) {
 	idx := &TokenIndex{
 		root:        NewTrieNode(),
+		closing:     make(chan struct{}),
+		signal:      make(chan struct{}),
 		path:        opts.Path,
 		measurement: opts.Measurement,
 		field:       opts.Field,
@@ -112,11 +119,12 @@ func NewTokenIndex(opts *Options) (*TokenIndex, error) {
 	}
 
 	// get a analyzer
-	dirs := strings.Split(opts.Path, " ")
+	dirs := strings.Split(opts.Path, "/")
 	analyzerPath := ""
-	for i := 0; i < len(dirs)-1; i++ {
+	for i := 0; i < len(dirs)-2; i++ {
 		analyzerPath = analyzerPath + dirs[i] + "/"
 	}
+	analyzerPath = analyzerPath + "/directory"
 	idx.analyzer, err = GetAnalyzer(analyzerPath, opts.Measurement, opts.Field, version)
 	if err != nil {
 		return nil, err
@@ -132,15 +140,26 @@ func NewTokenIndex(opts *Options) (*TokenIndex, error) {
 
 func (idx *TokenIndex) Open() error {
 	tbPath := path.Join(idx.path, idx.measurement, idx.field)
-	tb, err := mergeset.OpenTable(tbPath, nil, ClvIndexMerge)
+	tb, err := mergeset.OpenTable(tbPath, nil, nil)
 	if err != nil {
 		return fmt.Errorf("cannot open text index:%s, err: %+v", tbPath, err)
 	}
 	idx.tb = tb
+
+	// start a process routine
+	go idx.process()
+
 	return nil
 }
 
 func (idx *TokenIndex) Close() error {
+	if idx.signal != nil {
+		close(idx.signal)
+	}
+	if idx.closing != nil {
+		idx.closing <- struct{}{}
+		close(idx.closing)
+	}
 	return nil
 }
 
@@ -157,6 +176,7 @@ func (idx *TokenIndex) insertInvertedIndex(node *TrieNode, tsid uint64, timestam
 
 func (idx *TokenIndex) insertTrieNode(vtoken []string, tsid uint64, timestamp int64, position uint16) error {
 	idx.trieLock.Lock()
+	idx.docNum++
 	node := idx.root
 	for _, token := range vtoken {
 		child, ok := node.children[token]
@@ -183,11 +203,12 @@ func (idx *TokenIndex) insertSuffixToTrie(vtoken []string, id uint32) error {
 		}
 		node = child
 	}
-	idx.trieLock.Unlock()
 
 	if _, ok := node.ids[id]; !ok {
 		node.ids[id] = struct{}{}
 	}
+	idx.trieLock.Unlock()
+
 	return nil
 }
 
@@ -211,32 +232,13 @@ func (idx *TokenIndex) AddDocument(log string, tsid uint64, timestamp int64) err
 		for i := 1; i < len(vtoken.tokens); i++ {
 			idx.insertSuffixToTrie(vtoken.tokens[i:], vtoken.id)
 		}
-
 	}
+
+	if idx.docNum >= maxBuf {
+		idx.signal <- struct{}{}
+	}
+
 	return nil
-}
-
-func ClvIndexMerge(data []byte, items []mergeset.Item) ([]byte, []mergeset.Item) {
-	// TODO
-	return nil, nil
-}
-
-func (idx *TokenIndex) Process() {
-	idx.trieLock.Lock()
-	if len(idx.root.children) == 0 {
-		idx.trieLock.Unlock()
-		return
-	}
-	tmpNode := idx.root
-	idx.root = NewTrieNode()
-	idx.trieLock.Unlock()
-
-	// Deal the first level node of the tree.
-	for token, child := range tmpNode.children {
-		vtokens := token + " "
-		idx.TransferToMergeset(vtokens, child)
-	}
-
 }
 
 var idxItemsPool mergeindex.IndexItemsPool
@@ -245,52 +247,9 @@ func (idx *TokenIndex) writeDicVersion(version uint32) {
 	return
 }
 
-func (idx *TokenIndex) TransferToMergeset(vtoken string, node *TrieNode) {
-	var flag uint8
-	if len(node.invertedIndex) != 0 {
-		flag = flag | posFlag
-	}
-	if len(node.ids) != 0 {
-		flag = flag | idFlag
-	}
-	if flag != 0 {
-		idx.createTextIndex(vtoken, flag, node)
-		return
-	}
-	// go on
-	for token, child := range node.children {
-		vtokens := vtoken + token + " "
-		idx.TransferToMergeset(vtokens, child)
-	}
-}
-
-func (idx *TokenIndex) createTextIndex(vtoken string, flag uint8, node *TrieNode) error {
-	ii := idxItemsPool.Get()
-	defer idxItemsPool.Put(ii)
-
-	// write txPrefixPos + vtokens + suffix + flag
-	ii.B = append(ii.B, txPrefixPos)
-	ii.B = append(ii.B, []byte(vtoken)...)
-	ii.B = append(ii.B, txSuffix)
-	ii.B = append(ii.B, flag)
-
-	// write posList
-	if flag|posFlag != 0 {
-		ii.B = marshalPosList(ii.B, node)
-	}
-
-	// write idlist
-	if flag|idFlag != 0 {
-		ii.B = marshalIdList(ii.B, node)
-	}
-
-	// write to mergeset
-	return idx.tb.AddItems(ii.Items)
-}
-
-func marshalPosList(dst []byte, node *TrieNode) []byte {
+func (idx *TokenIndex) marshalPosList(dst []byte, node *TrieNode) []byte {
 	// len(sid)
-	dst = encoding.MarshalVarUint64(dst, uint64(len(node.invertedIndex)))
+	dst = encoding.MarshalUint32(dst, uint32(len(node.invertedIndex)))
 
 	for sid, iindex := range node.invertedIndex {
 		// prefixSid + sid + len(pos) + timelist + positionlist
@@ -301,7 +260,7 @@ func marshalPosList(dst []byte, node *TrieNode) []byte {
 		})
 		dst = append(dst, txPrefixSid)
 		dst = encoding.MarshalVarUint64(dst, sid)
-		dst = encoding.MarshalVarUint64(dst, uint64(len(istate)))
+		dst = encoding.MarshalUint32(dst, uint32(len(istate)))
 		posbuffer := make([]byte, 2*len(istate))
 		for i := 0; i < len(istate); i++ {
 			dst = encoding.MarshalInt64(dst, istate[i].timestamp)
@@ -312,7 +271,7 @@ func marshalPosList(dst []byte, node *TrieNode) []byte {
 	return dst
 }
 
-func marshalIdList(dst []byte, node *TrieNode) []byte {
+func (idx *TokenIndex) marshalIdList(dst []byte, node *TrieNode) []byte {
 	dst = append(dst, txPrefixId)
 	ids := make([]uint32, len(node.ids))
 	for id := range node.ids {
@@ -327,6 +286,84 @@ func marshalIdList(dst []byte, node *TrieNode) []byte {
 	}
 
 	return dst
+}
+
+func (idx *TokenIndex) createIndex(vtoken string, flag uint8, node *TrieNode) error {
+	ii := idxItemsPool.Get()
+	defer idxItemsPool.Put(ii)
+
+	// write txPrefixPos + vtokens + suffix + flag
+	ii.B = append(ii.B, txPrefixPos)
+	ii.B = append(ii.B, []byte(vtoken)...)
+	ii.B = append(ii.B, txSuffix)
+	ii.B = append(ii.B, flag)
+
+	// write posList
+	if flag&posFlag != 0 {
+		ii.B = idx.marshalPosList(ii.B, node)
+	}
+
+	// write idlist
+	if flag&idFlag != 0 {
+		ii.B = idx.marshalIdList(ii.B, node)
+	}
+	ii.Next()
+	// write to mergeset
+	return idx.tb.AddItems(ii.Items)
+}
+
+func (idx *TokenIndex) writeDocumentIndex(vtoken string, node *TrieNode) {
+	var flag uint8
+	if len(node.invertedIndex) != 0 {
+		flag = flag | posFlag
+	}
+	if len(node.ids) != 0 {
+		flag = flag | idFlag
+	}
+	if flag != 0 {
+		idx.createIndex(vtoken, flag, node)
+		return
+	}
+	// traversal of trees.
+	for token, child := range node.children {
+		vtokens := vtoken + token + " "
+		idx.writeDocumentIndex(vtokens, child)
+	}
+}
+
+func (idx *TokenIndex) processDocument() {
+	// replace the root node
+	idx.trieLock.Lock()
+	if len(idx.root.children) == 0 {
+		idx.trieLock.Unlock()
+		return
+	}
+	node := idx.root
+	idx.docNum = 0
+	idx.root = NewTrieNode()
+	idx.trieLock.Unlock()
+
+	// Deal the first level node of the tree.
+	for token, child := range node.children {
+		vtokens := token + " "
+		idx.writeDocumentIndex(vtokens, child)
+	}
+
+}
+
+func (idx *TokenIndex) process() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-idx.closing:
+			return
+		case <-idx.signal:
+		case <-ticker.C:
+			idx.processDocument()
+		}
+	}
 }
 
 var clvSearchPool sync.Pool
