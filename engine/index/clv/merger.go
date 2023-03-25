@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	fixedLen    = 5
+	fixedLen    = 7 // len(txSuffix) + len(prefixMeta) + len(flag) + len(metaOffset) + [len(SIDs)|len(IDs)] : 1+1+1+2+2
 	maxItemSize = 64 * 1024
 )
 
@@ -43,9 +43,9 @@ func (m *merger) addItem(item []byte) {
 	if len(m.items) == 1 {
 		prefix := bytes.IndexByte(item, txSuffix)
 		m.prefixKey = m.items[0][:prefix]
-		m.len = len(m.prefixKey) + 1
+		m.len = len(m.prefixKey) + fixedLen
 	}
-	m.len += len(item) - len(m.prefixKey) - 1
+	m.len += len(item) - len(m.prefixKey) - fixedLen
 }
 
 func (m *merger) reset() {

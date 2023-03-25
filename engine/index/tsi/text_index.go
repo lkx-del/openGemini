@@ -93,15 +93,23 @@ func (idx *TextIndex) Open() error {
 				continue
 			}
 			field := fieldDirs[fieldIdx].Name()
-			idx.NewTokenIndex(idx.path, measurement, field)
+			err := idx.NewTokenIndex(idx.path, measurement, field)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 func (idx *TextIndex) Close() error {
-	fmt.Println("TextIndex Close")
-	// TODO
+	for mst, tokenIndexMap := range idx.fieldTable {
+		for field, tokenIndex := range tokenIndexMap {
+			tokenIndex.Close()
+			fmt.Println("TextIndex Close:", mst, field)
+		}
+	}
+
 	return nil
 }
 
@@ -125,7 +133,10 @@ func (idx *TextIndex) CreateIndexIfNotExists(primaryIndex PrimaryIndex, row *inf
 			if !ok {
 				idx.fieldTableLock.Lock()
 				if idx.fieldTable[row.Name][field.Key] == nil {
-					idx.NewTokenIndex(idx.path, row.Name, field.Key)
+					err := idx.NewTokenIndex(idx.path, row.Name, field.Key)
+					if err != nil {
+						return 0, err
+					}
 				}
 				idx.fieldTableLock.Unlock()
 				tokenIndex = idx.fieldTable[row.Name][field.Key]

@@ -28,17 +28,6 @@ import (
 )
 
 const (
-	txPrefixPos = iota
-	txPrefixTerm
-	txPrefixDic
-	txPrefixDicVersion
-	txPrefixSid
-	txPrefixId
-	txPrefixMeta
-	txSuffix = 9
-)
-
-const (
 	qmin   = 1
 	maxBuf = 2000 // can not to large, otherwise AddItems may fail because the item size is greater than 64k.
 )
@@ -162,6 +151,7 @@ func (idx *TokenIndex) Close() error {
 		idx.closing <- struct{}{}
 		close(idx.closing)
 	}
+	idx.tb.MustClose()
 	return nil
 }
 

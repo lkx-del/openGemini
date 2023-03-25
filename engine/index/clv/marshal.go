@@ -25,6 +25,17 @@ import (
 )
 
 const (
+	txPrefixPos = iota
+	txPrefixTerm
+	txPrefixDic
+	txPrefixDicVersion
+	txPrefixSid
+	txPrefixId
+	txPrefixMeta
+	txSuffix = 9
+)
+
+const (
 	posFlag = 1
 	idFlag  = 2
 )
