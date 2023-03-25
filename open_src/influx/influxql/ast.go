@@ -4482,11 +4482,20 @@ func (v *binaryExprNameVisitor) Visit(n Node) Visitor {
 type MatchExpr struct {
 	Field Expr
 	Value Expr
-	Op    string
+	Op    int
 }
 
 func (m *MatchExpr) String() string {
-	return m.Field.String() + m.Op + m.Value.String()
+	s := m.Field.String()
+	if m.Op == MATCH {
+		s += " MATCH "
+	} else if m.Op == MATCH_PHRASE {
+		s += " MATCH_PHRASE "
+	} else {
+		panic(s)
+	}
+	s += m.Value.String()
+	return s
 }
 func (m *MatchExpr) RewriteNameSpace(alias, mst string) {
 
